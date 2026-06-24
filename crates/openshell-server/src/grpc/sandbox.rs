@@ -2259,6 +2259,7 @@ mod tests {
                 .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
