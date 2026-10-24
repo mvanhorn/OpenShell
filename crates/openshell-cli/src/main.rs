@@ -1354,8 +1354,12 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Print only the active policy YAML (same policy as the default view; stdout only).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         policy_only: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "policy_only")]
+        output: OutputFormat,
     },
 
     /// List sandboxes.
@@ -2782,9 +2786,14 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name, policy_only } => {
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                            output,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
+                            run::sandbox_get(endpoint, &name, policy_only, output.as_str(), &tls)
+                                .await?;
                         }
                         SandboxCommands::List {
                             limit,
@@ -3941,6 +3950,53 @@ mod tests {
     fn sandbox_list_json_conflicts_with_names() {
         let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--names"]);
         assert!(result.is_err(), "--names and -o json should conflict");
+    }
+
+    #[test]
+    fn sandbox_get_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "get", "my-sandbox"])
+            .expect("sandbox get should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Get {
+                    output: OutputFormat::Table,
+                    policy_only: false,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_get_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "get", "my-sandbox", "-o", "json"])
+            .expect("sandbox get -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Get {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_get_json_conflicts_with_policy_only() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "get",
+            "my-sandbox",
+            "-o",
+            "json",
+            "--policy-only",
+        ]);
+        assert!(result.is_err(), "--policy-only and -o json should conflict");
     }
 
     #[test]

@@ -20,7 +20,9 @@ Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
 `openshell.progress.*` metadata defined in `openshell-core` instead of requiring
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
-reason strings.
+reason strings. Kubernetes `FailedScheduling` events and `PodScheduled=False`
+conditions attach a waiting-to-be-scheduled step plus the scheduler message, and
+the driver persists that reason on sandbox status until the pod is `Scheduled`.
 
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated

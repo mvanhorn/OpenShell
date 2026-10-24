@@ -30,7 +30,7 @@ use openshell_bootstrap::{
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
-    PROGRESS_STEP_STARTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX, PROGRESS_STEP_WAITING_TO_BE_SCHEDULED,
 };
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
@@ -131,6 +131,34 @@ fn ready_false_condition_message(
         condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
     })?;
 
+    format_condition_summary(condition)
+}
+
+fn scheduling_wait_condition(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<&openshell_core::proto::SandboxCondition> {
+    status?.conditions.iter().find(|condition| {
+        condition.status.eq_ignore_ascii_case("false")
+            && condition.reason.eq_ignore_ascii_case("Unschedulable")
+            && (condition.r#type == "PodScheduled" || condition.r#type == "Ready")
+    })
+}
+
+fn scheduling_wait_message(status: Option<&openshell_core::proto::SandboxStatus>) -> Option<&str> {
+    let message = scheduling_wait_condition(status)?.message.as_str();
+    (!message.is_empty()).then_some(message)
+}
+
+fn last_reported_status_message(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<String> {
+    if let Some(condition) = scheduling_wait_condition(status) {
+        return format_condition_summary(condition);
+    }
+    ready_false_condition_message(status)
+}
+
+fn format_condition_summary(condition: &openshell_core::proto::SandboxCondition) -> Option<String> {
     if condition.message.is_empty() {
         if condition.reason.is_empty() {
             None
@@ -215,6 +243,8 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
 enum ProvisioningStep {
     /// Sandbox CRD created, waiting for pod to be scheduled.
     RequestingSandbox,
+    /// Kubernetes pod is Pending because the scheduler cannot place it.
+    WaitingToBeScheduled,
     /// Pulling the sandbox container image.
     PullingSandboxImage,
     /// Container is starting up.
@@ -226,6 +256,7 @@ impl ProvisioningStep {
     fn completed_label(self) -> &'static str {
         match self {
             Self::RequestingSandbox => "Sandbox allocated",
+            Self::WaitingToBeScheduled => "Sandbox scheduled",
             Self::PullingSandboxImage => "Image pulled",
             Self::StartingSandbox => "Sandbox ready",
         }
@@ -235,6 +266,7 @@ impl ProvisioningStep {
     fn active_label(self) -> &'static str {
         match self {
             Self::RequestingSandbox => "Requesting sandbox...",
+            Self::WaitingToBeScheduled => "Waiting to be scheduled...",
             Self::PullingSandboxImage => "Pulling image...",
             Self::StartingSandbox => "Starting sandbox...",
         }
@@ -402,6 +434,7 @@ fn format_timestamp(d: Duration) -> String {
 fn progress_step_from_metadata(value: &str) -> Option<ProvisioningStep> {
     match value {
         PROGRESS_STEP_REQUESTING_SANDBOX => Some(ProvisioningStep::RequestingSandbox),
+        PROGRESS_STEP_WAITING_TO_BE_SCHEDULED => Some(ProvisioningStep::WaitingToBeScheduled),
         PROGRESS_STEP_PULLING_IMAGE => Some(ProvisioningStep::PullingSandboxImage),
         PROGRESS_STEP_STARTING_SANDBOX => Some(ProvisioningStep::StartingSandbox),
         _ => None,
@@ -450,6 +483,7 @@ fn handle_platform_progress_event(
 
     if let Some(step) = active_step
         && let Some(d) = display.as_mut()
+        && d.active_label != step.active_label()
     {
         d.set_active_step(step);
     }
@@ -475,7 +509,23 @@ fn handle_platform_progress_event(
     true
 }
 
+fn is_scheduling_wait_progress_event(event: &PlatformEvent) -> bool {
+    event
+        .metadata
+        .get(PROGRESS_ACTIVE_STEP_KEY)
+        .map(String::as_str)
+        == Some(PROGRESS_STEP_WAITING_TO_BE_SCHEDULED)
+        && !event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
+}
+
 fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
+    // Waiting-to-be-scheduled is visible on the provisioning display, but it
+    // does not extend the create idle deadline. An unschedulable pod may sit
+    // in that state indefinitely, and the current timeout behavior is kept.
+    if is_scheduling_wait_progress_event(event) {
+        return false;
+    }
+
     if event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
         || event.metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY)
         || event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY)
@@ -2042,7 +2092,7 @@ pub async fn sandbox_create(
 
     let mut last_phase = sandbox.phase();
     let mut last_error_reason = String::new();
-    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
+    let mut last_condition_message = last_reported_status_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
@@ -2058,8 +2108,9 @@ pub async fn sandbox_create(
     loop {
         // Timeout only when provisioning goes idle. VM first-create can spend
         // longer than the default timeout pulling and preparing large images,
-        // but only recognized progress events extend the idle deadline. Logs
-        // and generic status churn must not keep a stuck sandbox alive forever.
+        // but only recognized progress events extend the idle deadline. Logs,
+        // generic status churn, and Kubernetes scheduling-wait events must not
+        // keep a stuck sandbox alive forever.
         let remaining = provisioning_idle_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let timeout_message = provisioning_timeout_message(
@@ -2099,7 +2150,7 @@ pub async fn sandbox_create(
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
-                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                if let Some(message) = last_reported_status_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
 
@@ -2611,6 +2662,7 @@ pub async fn sandbox_get(
     server: &str,
     name: &str,
     policy_only: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -2631,6 +2683,10 @@ pub async fn sandbox_get(
     } else {
         sandbox.object_id().to_string()
     };
+
+    if !policy_only && crate::output::print_output_single(output, &sandbox, sandbox_to_json)? {
+        return Ok(());
+    }
 
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
@@ -2665,6 +2721,14 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(condition) = scheduling_wait_condition(sandbox.status.as_ref()) {
+        println!("  {} Waiting to be scheduled", "Scheduling:".dimmed());
+        if !condition.message.is_empty() {
+            println!("  {} {}", "Message:".dimmed(), condition.message);
+        } else if !condition.reason.is_empty() {
+            println!("  {} {}", "Reason:".dimmed(), condition.reason);
+        }
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -3393,13 +3457,20 @@ pub async fn sandbox_list(
         .unwrap_or(4)
         .max(4);
     let created_width = 19; // "YYYY-MM-DD HH:MM:SS"
+    let phase_width = sandboxes
+        .iter()
+        .map(|s| phase_name(s.phase()).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
 
     // Print header
     println!(
-        "{:<name_width$}  {:<created_width$}  {}",
+        "{:<name_width$}  {:<created_width$}  {:<phase_width$}  {}",
         "NAME".bold(),
         "CREATED".bold(),
         "PHASE".bold(),
+        "STATUS".bold(),
     );
 
     // Print rows
@@ -3413,21 +3484,34 @@ pub async fn sandbox_list(
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
+        let status = sandbox_list_status(&sandbox);
+        let phase_pad = " ".repeat(phase_width.saturating_sub(phase.len()));
         println!(
-            "{:<name_width$}  {:<created_width$}  {}",
+            "{:<name_width$}  {:<created_width$}  {phase_colored}{phase_pad}  {status}",
             sandbox.object_name().to_string(),
             created,
-            phase_colored,
         );
     }
 
     Ok(())
 }
 
+fn sandbox_list_status(sandbox: &Sandbox) -> String {
+    if let Some(message) = scheduling_wait_message(sandbox.status.as_ref()) {
+        const MAX_LEN: usize = 72;
+        if message.chars().count() > MAX_LEN {
+            let truncated: String = message.chars().take(MAX_LEN.saturating_sub(3)).collect();
+            return format!("{truncated}...");
+        }
+        return message.to_string();
+    }
+    String::new()
+}
+
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
@@ -3435,6 +3519,26 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+    });
+    if let Some(status) = sandbox.status.as_ref() {
+        value["status"] = sandbox_status_to_json(status);
+    }
+    value
+}
+
+fn sandbox_status_to_json(status: &openshell_core::proto::SandboxStatus) -> serde_json::Value {
+    serde_json::json!({
+        "sandbox_name": status.sandbox_name,
+        "agent_pod": status.agent_pod,
+        "conditions": status.conditions.iter().map(|condition| {
+            serde_json::json!({
+                "type": condition.r#type,
+                "status": condition.status,
+                "reason": condition.reason,
+                "message": condition.message,
+                "last_transition_time": condition.last_transition_time,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -7898,15 +8002,16 @@ mod tests {
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
-        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
-        inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
+        gateway_type_label, git_sync_files, handle_platform_progress_event, http_health_check,
+        import_local_package_mtls_bundle, inferred_provider_type, is_provisioning_progress_event,
+        last_reported_status_message, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
         plaintext_gateway_is_remote, progress_step_from_metadata,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        sandbox_list_status, sandbox_should_persist, sandbox_to_json, sandbox_upload_plan,
+        scheduling_wait_message, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7923,14 +8028,16 @@ mod tests {
         load_gateway_metadata, load_user_active_gateway, store_gateway_metadata,
     };
     use openshell_core::progress::{
+        PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_STEP_KEY,
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
-        PROGRESS_STEP_STARTING_SANDBOX,
+        PROGRESS_STEP_STARTING_SANDBOX, PROGRESS_STEP_WAITING_TO_BE_SCHEDULED,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        GpuResourceRequirements, PlatformEvent, Provider, ProviderCredentialRefresh,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -8201,6 +8308,10 @@ mod tests {
             Some(ProvisioningStep::RequestingSandbox)
         );
         assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_WAITING_TO_BE_SCHEDULED),
+            Some(ProvisioningStep::WaitingToBeScheduled)
+        );
+        assert_eq!(
             progress_step_from_metadata(PROGRESS_STEP_PULLING_IMAGE),
             Some(ProvisioningStep::PullingSandboxImage)
         );
@@ -8209,6 +8320,130 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    fn waiting_to_be_scheduled_progress_event() -> PlatformEvent {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            PROGRESS_ACTIVE_STEP_KEY.to_string(),
+            PROGRESS_STEP_WAITING_TO_BE_SCHEDULED.to_string(),
+        );
+        metadata.insert(
+            PROGRESS_ACTIVE_DETAIL_KEY.to_string(),
+            "0/3 nodes are available: 3 Insufficient memory.".to_string(),
+        );
+        PlatformEvent {
+            source: "kubernetes".to_string(),
+            reason: "FailedScheduling".to_string(),
+            message: "0/3 nodes are available: 3 Insufficient memory.".to_string(),
+            metadata,
+            ..PlatformEvent::default()
+        }
+    }
+
+    #[test]
+    fn waiting_to_be_scheduled_step_uses_explicit_active_label() {
+        assert_eq!(
+            ProvisioningStep::WaitingToBeScheduled.active_label(),
+            "Waiting to be scheduled..."
+        );
+    }
+
+    #[test]
+    fn scheduling_wait_progress_event_updates_step_state_without_extending_idle_deadline() {
+        let event = waiting_to_be_scheduled_progress_event();
+        let mut display = None;
+        assert!(handle_platform_progress_event(
+            &event,
+            &mut display,
+            std::time::Instant::now()
+        ));
+        assert!(!is_provisioning_progress_event(&event));
+    }
+
+    #[test]
+    fn scheduled_progress_event_still_extends_idle_deadline() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            PROGRESS_COMPLETE_STEP_KEY.to_string(),
+            PROGRESS_STEP_REQUESTING_SANDBOX.to_string(),
+        );
+        metadata.insert(
+            PROGRESS_ACTIVE_STEP_KEY.to_string(),
+            PROGRESS_STEP_PULLING_IMAGE.to_string(),
+        );
+        let event = PlatformEvent {
+            source: "kubernetes".to_string(),
+            reason: "Scheduled".to_string(),
+            metadata,
+            ..PlatformEvent::default()
+        };
+
+        assert!(is_provisioning_progress_event(&event));
+        let mut display = None;
+        assert!(handle_platform_progress_event(
+            &event,
+            &mut display,
+            std::time::Instant::now()
+        ));
+    }
+
+    fn unschedulable_sandbox() -> Sandbox {
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "pending-sandbox".to_string(),
+                created_at_ms: 0,
+                labels: std::collections::HashMap::new(),
+                resource_version: 1,
+            }),
+            status: Some(SandboxStatus {
+                sandbox_name: "pending-sandbox".to_string(),
+                agent_pod: "pending-sandbox".to_string(),
+                conditions: vec![SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: "Unschedulable".to_string(),
+                    message: "0/3 nodes are available: 3 Insufficient memory.".to_string(),
+                    last_transition_time: String::new(),
+                }],
+                ..SandboxStatus::default()
+            }),
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox
+    }
+
+    #[test]
+    fn sandbox_to_json_includes_unschedulable_condition() {
+        let value = sandbox_to_json(&unschedulable_sandbox());
+        assert_eq!(value["name"], "pending-sandbox");
+        assert_eq!(value["phase"], "Provisioning");
+        assert_eq!(value["status"]["conditions"][0]["type"], "PodScheduled");
+        assert_eq!(value["status"]["conditions"][0]["status"], "False");
+        assert_eq!(value["status"]["conditions"][0]["reason"], "Unschedulable");
+        assert_eq!(
+            value["status"]["conditions"][0]["message"],
+            "0/3 nodes are available: 3 Insufficient memory."
+        );
+    }
+
+    #[test]
+    fn sandbox_list_status_and_get_message_use_scheduler_reason() {
+        let sandbox = unschedulable_sandbox();
+        assert_eq!(
+            sandbox_list_status(&sandbox),
+            "0/3 nodes are available: 3 Insufficient memory."
+        );
+        assert_eq!(
+            scheduling_wait_message(sandbox.status.as_ref()),
+            Some("0/3 nodes are available: 3 Insufficient memory.")
+        );
+        assert_eq!(
+            last_reported_status_message(sandbox.status.as_ref()).as_deref(),
+            Some("Unschedulable: 0/3 nodes are available: 3 Insufficient memory.")
+        );
     }
 
     #[test]

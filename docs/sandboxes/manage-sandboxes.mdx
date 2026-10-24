@@ -20,6 +20,10 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+Create shows provisioning steps as the runtime allocates the sandbox, pulls the image, and starts the supervisor. On Kubernetes, if the sandbox pod cannot be placed, the display switches to `Waiting to be scheduled...` and shows the scheduler reason, for example `0/3 nodes are available: 3 Insufficient memory`. After the pod schedules, image pull and start continue.
+
+The create command's idle timeout does not reset while the pod is waiting to be scheduled. If no other provisioning progress occurs, create still times out. `openshell sandbox get` and `openshell sandbox list -o json` keep showing the latest scheduler reason until the pod schedules or you delete the sandbox.
+
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
@@ -296,17 +300,18 @@ Filter the list by labels when you want a narrower view:
 openshell sandbox list --selector team=platform
 ```
 
-Use `-o json` or `-o yaml` for machine-readable output:
+Use `-o json` or `-o yaml` for machine-readable output. JSON includes sandbox `phase` and `status.conditions`, so a Kubernetes sandbox that is waiting to be scheduled reports `PodScheduled=False` with reason `Unschedulable` and the scheduler message:
 
 ```shell
 openshell sandbox list -o json
 openshell sandbox list -o yaml
 ```
 
-Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
+Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML. While a Kubernetes sandbox is unscheduled, get also prints `Scheduling: Waiting to be scheduled` and the scheduler message. Use `-o json` for the same condition fields:
 
 ```shell
 openshell sandbox get my-sandbox
+openshell sandbox get my-sandbox -o json
 ```
 
 Print only that policy YAML for scripting (same effective policy, no metadata):
@@ -427,7 +432,7 @@ Every sandbox moves through a defined set of phases:
 
 | Phase        | Description                                                                                                                            |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. On Kubernetes this includes waiting for the scheduler when the pod is Pending. |
 | Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
 | Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |

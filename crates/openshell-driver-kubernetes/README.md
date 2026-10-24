@@ -21,7 +21,12 @@ the gateway process, and uses `v1beta1` when available before falling back to
 `v1alpha1`. Restart the gateway after an in-place Agent Sandbox upgrade so the
 driver can detect served API versions again. Driver events map Kubernetes object
 state and platform events into the shared compute-driver protobuf surface used
-by the gateway.
+by the gateway. While a sandbox pod is `Pending` and unscheduled, the driver
+forwards kube-scheduler `FailedScheduling` events with provisioning progress
+metadata and records the latest `PodScheduled=False` / `Unschedulable` reason on
+sandbox status so `sandbox get` and `sandbox list` can show why the pod is
+waiting. A later `Scheduled` event clears that wait and resumes image-pull
+progress.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.

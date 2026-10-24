@@ -12,6 +12,7 @@ pub const PROGRESS_ACTIVE_STEP_KEY: &str = "openshell.progress.active_step";
 pub const PROGRESS_ACTIVE_DETAIL_KEY: &str = "openshell.progress.active_detail";
 
 pub const PROGRESS_STEP_REQUESTING_SANDBOX: &str = "requesting_sandbox";
+pub const PROGRESS_STEP_WAITING_TO_BE_SCHEDULED: &str = "waiting_to_be_scheduled";
 pub const PROGRESS_STEP_PULLING_IMAGE: &str = "pulling_image";
 pub const PROGRESS_STEP_STARTING_SANDBOX: &str = "starting_sandbox";
 

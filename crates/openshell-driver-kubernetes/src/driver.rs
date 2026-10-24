@@ -11,7 +11,8 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Volume,
+    VolumeMount,
 };
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
@@ -25,7 +26,8 @@ use openshell_core::driver_utils::{
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
+    PROGRESS_STEP_WAITING_TO_BE_SCHEDULED, format_bytes, mark_progress_active,
+    mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -94,6 +96,12 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
+const POD_SCHEDULED_CONDITION: &str = "PodScheduled";
+const UNSCHEDULABLE_REASON: &str = "Unschedulable";
+const FAILED_SCHEDULING_REASON: &str = "FailedScheduling";
+const SCHEDULED_REASON: &str = "Scheduled";
+
+type SchedulingWaitMap = std::collections::HashMap<String, String>;
 
 struct AgentSandboxApi {
     api: Api<DynamicObject>,
@@ -431,6 +439,7 @@ pub struct KubernetesComputeDriver {
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
+    scheduling_waits: Arc<std::sync::Mutex<SchedulingWaitMap>>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -480,6 +489,7 @@ impl KubernetesComputeDriver {
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
+            scheduling_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -695,7 +705,11 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
-            Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
+            Ok(Ok(obj)) => {
+                let mut sandbox = sandbox_from_object(&self.config.namespace, obj)?;
+                self.enrich_scheduling_status(&mut sandbox).await;
+                Ok(Some(sandbox))
+            }
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
                 Ok(None)
@@ -748,6 +762,9 @@ impl KubernetesComputeDriver {
                         .cmp(&right.name)
                         .then_with(|| left.id.cmp(&right.id))
                 });
+                for sandbox in &mut sandboxes {
+                    apply_cached_scheduling_wait(sandbox, &self.scheduling_waits);
+                }
                 Ok(sandboxes)
             }
             Ok(Err(err)) => {
@@ -973,24 +990,27 @@ impl KubernetesComputeDriver {
             watcher::watcher(agent_sandbox_api.api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
+        let scheduling_waits = Arc::clone(&self.scheduling_waits);
 
         tokio::spawn(async move {
             let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
             let mut agent_pod_to_id = std::collections::HashMap::<String, String>::new();
+            let mut last_sandboxes = std::collections::HashMap::<String, Sandbox>::new();
 
             loop {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
-                            match sandbox_from_object(&namespace, obj) {
+                            match observe_sandbox_object(
+                                &namespace,
+                                obj,
+                                &mut sandbox_name_to_id,
+                                &mut agent_pod_to_id,
+                                &mut last_sandboxes,
+                                &scheduling_waits,
+                            ) {
                                 Ok(sandbox) => {
-                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
+                                    if tx.send(Ok(watch_sandbox_event(sandbox))).await.is_err() {
                                         break;
                                     }
                                 }
@@ -1005,6 +1025,8 @@ impl KubernetesComputeDriver {
                             match sandbox_id_from_object(&obj) {
                                 Ok(sandbox_id) => {
                                     remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
+                                    last_sandboxes.remove(&sandbox_id);
+                                    clear_scheduling_wait(&scheduling_waits, &sandbox_id);
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Deleted(
                                             WatchSandboxesDeletedEvent { sandbox_id }
@@ -1023,15 +1045,16 @@ impl KubernetesComputeDriver {
                         }
                         Ok(Some(Event::Restarted(objs))) => {
                             for obj in objs {
-                                match sandbox_from_object(&namespace, obj) {
+                                match observe_sandbox_object(
+                                    &namespace,
+                                    obj,
+                                    &mut sandbox_name_to_id,
+                                    &mut agent_pod_to_id,
+                                    &mut last_sandboxes,
+                                    &scheduling_waits,
+                                ) {
                                     Ok(sandbox) => {
-                                        update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
-                                        let event = WatchSandboxesEvent {
-                                            payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                                WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                            )),
-                                        };
-                                        if tx.send(Ok(event)).await.is_err() {
+                                        if tx.send(Ok(watch_sandbox_event(sandbox))).await.is_err() {
                                             return;
                                         }
                                     }
@@ -1061,6 +1084,14 @@ impl KubernetesComputeDriver {
                                 &agent_pod_to_id,
                                 &obj,
                             ) {
+                                if let Some(snapshot) = apply_event_scheduling_wait(
+                                    &scheduling_waits,
+                                    &mut last_sandboxes,
+                                    &sandbox_id,
+                                    &event,
+                                ) && tx.send(Ok(watch_sandbox_event(snapshot))).await.is_err() {
+                                    break;
+                                }
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
                                         WatchSandboxesPlatformEvent { sandbox_id, event: Some(event) }
@@ -1091,6 +1122,30 @@ impl KubernetesComputeDriver {
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    async fn enrich_scheduling_status(&self, sandbox: &mut Sandbox) {
+        let pod_name = sandbox
+            .status
+            .as_ref()
+            .map(|status| status.instance_id.as_str())
+            .filter(|name| !name.is_empty());
+        let from_pod = if let Some(pod_name) = pod_name {
+            live_pod_scheduling_wait(&self.client, &self.config.namespace, pod_name).await
+        } else {
+            None
+        };
+        match from_pod {
+            Some(SchedulingWait::Unschedulable(message)) => {
+                set_scheduling_wait(&self.scheduling_waits, &sandbox.id, Some(&message));
+                apply_scheduling_wait_to_sandbox(sandbox, Some(&message));
+            }
+            Some(SchedulingWait::Scheduled) => {
+                set_scheduling_wait(&self.scheduling_waits, &sandbox.id, None);
+                apply_scheduling_wait_to_sandbox(sandbox, None);
+            }
+            None => apply_cached_scheduling_wait(sandbox, &self.scheduling_waits),
+        }
     }
 }
 
@@ -1236,13 +1291,19 @@ fn attach_kube_progress_metadata(
     message: &str,
 ) {
     match reason {
-        "Scheduled" => {
+        SCHEDULED_REASON => {
             mark_progress_complete(
                 metadata,
                 PROGRESS_STEP_REQUESTING_SANDBOX,
                 "Sandbox allocated",
             );
             mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+        }
+        FAILED_SCHEDULING_REASON | UNSCHEDULABLE_REASON => {
+            mark_progress_active(metadata, PROGRESS_STEP_WAITING_TO_BE_SCHEDULED);
+            if !message.is_empty() {
+                mark_progress_detail(metadata, message);
+            }
         }
         "Pulling" => {
             mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
@@ -1256,6 +1317,188 @@ fn attach_kube_progress_metadata(
             mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
         }
         _ => {}
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchedulingWait {
+    Unschedulable(String),
+    Scheduled,
+}
+
+fn scheduling_wait_from_reason(reason: &str, message: &str) -> Option<SchedulingWait> {
+    match reason {
+        FAILED_SCHEDULING_REASON | UNSCHEDULABLE_REASON => {
+            Some(SchedulingWait::Unschedulable(message.to_string()))
+        }
+        SCHEDULED_REASON => Some(SchedulingWait::Scheduled),
+        _ => None,
+    }
+}
+
+fn scheduling_wait_from_pod(pod: &Pod) -> Option<SchedulingWait> {
+    let conditions = pod.status.as_ref()?.conditions.as_ref()?;
+    conditions.iter().find_map(|condition| {
+        if condition.type_ != POD_SCHEDULED_CONDITION {
+            return None;
+        }
+        if condition.status.eq_ignore_ascii_case("true") {
+            return Some(SchedulingWait::Scheduled);
+        }
+        if condition.status.eq_ignore_ascii_case("false")
+            && condition
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.eq_ignore_ascii_case(UNSCHEDULABLE_REASON))
+        {
+            return Some(SchedulingWait::Unschedulable(
+                condition.message.clone().unwrap_or_default(),
+            ));
+        }
+        None
+    })
+}
+
+fn pod_scheduled_unschedulable_condition(message: &str) -> SandboxCondition {
+    SandboxCondition {
+        r#type: POD_SCHEDULED_CONDITION.to_string(),
+        status: "False".to_string(),
+        reason: UNSCHEDULABLE_REASON.to_string(),
+        message: message.to_string(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn apply_scheduling_wait(status: &mut SandboxStatus, wait: Option<&str>) {
+    match wait {
+        Some(message) => {
+            if let Some(existing) = status
+                .conditions
+                .iter_mut()
+                .find(|condition| condition.r#type == POD_SCHEDULED_CONDITION)
+            {
+                existing.status = "False".to_string();
+                existing.reason = UNSCHEDULABLE_REASON.to_string();
+                existing.message = message.to_string();
+            } else {
+                status
+                    .conditions
+                    .push(pod_scheduled_unschedulable_condition(message));
+            }
+        }
+        None => {
+            status.conditions.retain(|condition| {
+                !(condition.r#type == POD_SCHEDULED_CONDITION
+                    && condition.status.eq_ignore_ascii_case("false")
+                    && condition.reason.eq_ignore_ascii_case(UNSCHEDULABLE_REASON))
+            });
+        }
+    }
+}
+
+fn apply_scheduling_wait_to_sandbox(sandbox: &mut Sandbox, wait: Option<&str>) {
+    match sandbox.status.as_mut() {
+        Some(status) => apply_scheduling_wait(status, wait),
+        None => {
+            if let Some(message) = wait {
+                sandbox.status = Some(SandboxStatus {
+                    conditions: vec![pod_scheduled_unschedulable_condition(message)],
+                    ..Default::default()
+                });
+            }
+        }
+    }
+}
+
+fn lock_scheduling_waits(
+    waits: &std::sync::Mutex<SchedulingWaitMap>,
+) -> std::sync::MutexGuard<'_, SchedulingWaitMap> {
+    waits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn set_scheduling_wait(
+    waits: &std::sync::Mutex<SchedulingWaitMap>,
+    sandbox_id: &str,
+    wait: Option<&str>,
+) {
+    let mut waits = lock_scheduling_waits(waits);
+    match wait {
+        Some(message) => {
+            waits.insert(sandbox_id.to_string(), message.to_string());
+        }
+        None => {
+            waits.remove(sandbox_id);
+        }
+    }
+}
+
+fn clear_scheduling_wait(waits: &std::sync::Mutex<SchedulingWaitMap>, sandbox_id: &str) {
+    set_scheduling_wait(waits, sandbox_id, None);
+}
+
+fn apply_cached_scheduling_wait(
+    sandbox: &mut Sandbox,
+    waits: &std::sync::Mutex<SchedulingWaitMap>,
+) {
+    let wait = lock_scheduling_waits(waits).get(&sandbox.id).cloned();
+    if let Some(message) = wait {
+        apply_scheduling_wait_to_sandbox(sandbox, Some(&message));
+    }
+}
+
+fn observe_sandbox_object(
+    namespace: &str,
+    obj: DynamicObject,
+    sandbox_name_to_id: &mut std::collections::HashMap<String, String>,
+    agent_pod_to_id: &mut std::collections::HashMap<String, String>,
+    last_sandboxes: &mut std::collections::HashMap<String, Sandbox>,
+    scheduling_waits: &std::sync::Mutex<SchedulingWaitMap>,
+) -> Result<Sandbox, String> {
+    let mut sandbox = sandbox_from_object(namespace, obj)?;
+    apply_cached_scheduling_wait(&mut sandbox, scheduling_waits);
+    update_indexes(sandbox_name_to_id, agent_pod_to_id, &sandbox);
+    last_sandboxes.insert(sandbox.id.clone(), sandbox.clone());
+    Ok(sandbox)
+}
+
+fn apply_event_scheduling_wait(
+    waits: &std::sync::Mutex<SchedulingWaitMap>,
+    last_sandboxes: &mut std::collections::HashMap<String, Sandbox>,
+    sandbox_id: &str,
+    event: &PlatformEvent,
+) -> Option<Sandbox> {
+    let wait = scheduling_wait_from_reason(&event.reason, &event.message)?;
+    let wait_message = match &wait {
+        SchedulingWait::Unschedulable(message) => Some(message.as_str()),
+        SchedulingWait::Scheduled => None,
+    };
+    set_scheduling_wait(waits, sandbox_id, wait_message);
+    let sandbox = last_sandboxes.get_mut(sandbox_id)?;
+    apply_scheduling_wait_to_sandbox(sandbox, wait_message);
+    Some(sandbox.clone())
+}
+
+fn watch_sandbox_event(sandbox: Sandbox) -> WatchSandboxesEvent {
+    WatchSandboxesEvent {
+        payload: Some(watch_sandboxes_event::Payload::Sandbox(
+            WatchSandboxesSandboxEvent {
+                sandbox: Some(sandbox),
+            },
+        )),
+    }
+}
+
+async fn live_pod_scheduling_wait(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+) -> Option<SchedulingWait> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(pod_name)).await {
+        Ok(Ok(pod)) => scheduling_wait_from_pod(&pod),
+        _ => None,
     }
 }
 
@@ -3770,6 +4013,222 @@ mod tests {
             metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
             Some(PROGRESS_STEP_STARTING_SANDBOX)
         );
+    }
+
+    #[test]
+    fn kube_failed_scheduling_event_adds_waiting_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+        let message = "0/3 nodes are available: 3 Insufficient memory.";
+
+        attach_kube_progress_metadata(&mut metadata, "FailedScheduling", message);
+
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_WAITING_TO_BE_SCHEDULED)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+            Some(message)
+        );
+        assert!(!metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY));
+    }
+
+    #[test]
+    fn kube_unschedulable_reason_adds_waiting_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Unschedulable",
+            "0/1 nodes are available: 1 node(s) had untolerated taint",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_WAITING_TO_BE_SCHEDULED)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+            Some("0/1 nodes are available: 1 node(s) had untolerated taint")
+        );
+    }
+
+    #[test]
+    fn kube_scheduled_event_clears_wait_and_completes_requesting() {
+        let mut metadata = std::collections::HashMap::new();
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "FailedScheduling",
+            "0/3 nodes are available: 3 Insufficient memory.",
+        );
+
+        metadata.clear();
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Scheduled",
+            "Successfully assigned openshell/sandbox-abc to node-1",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_REQUESTING_SANDBOX)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_ne!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_WAITING_TO_BE_SCHEDULED)
+        );
+    }
+
+    #[test]
+    fn apply_scheduling_wait_upserts_pod_scheduled_condition() {
+        let mut status = SandboxStatus::default();
+        let message = "0/3 nodes are available: 3 Insufficient memory.";
+
+        apply_scheduling_wait(&mut status, Some(message));
+
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "PodScheduled");
+        assert_eq!(status.conditions[0].status, "False");
+        assert_eq!(status.conditions[0].reason, "Unschedulable");
+        assert_eq!(status.conditions[0].message, message);
+
+        apply_scheduling_wait(
+            &mut status,
+            Some("0/3 nodes are available: 3 node(s) had taint"),
+        );
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(
+            status.conditions[0].message,
+            "0/3 nodes are available: 3 node(s) had taint"
+        );
+    }
+
+    #[test]
+    fn apply_scheduling_wait_clears_unschedulable_condition_once_scheduled() {
+        let mut status = SandboxStatus {
+            conditions: vec![
+                pod_scheduled_unschedulable_condition(
+                    "0/3 nodes are available: 3 Insufficient memory.",
+                ),
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "DependenciesNotReady".to_string(),
+                    message: "Pod exists with phase: Pending; Service Exists".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..SandboxStatus::default()
+        };
+
+        apply_scheduling_wait(&mut status, None);
+
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "Ready");
+        assert_eq!(status.conditions[0].reason, "DependenciesNotReady");
+    }
+
+    #[test]
+    fn scheduling_wait_from_pod_reads_unschedulable_condition() {
+        let pod = Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: Some("Unschedulable".to_string()),
+                    message: Some("0/3 nodes are available: 3 Insufficient memory.".to_string()),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduling_wait_from_pod(&pod),
+            Some(SchedulingWait::Unschedulable(
+                "0/3 nodes are available: 3 Insufficient memory.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn scheduling_wait_from_pod_reads_scheduled_condition() {
+        let pod = Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    reason: Some("Scheduled".to_string()),
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduling_wait_from_pod(&pod),
+            Some(SchedulingWait::Scheduled)
+        );
+    }
+
+    #[test]
+    fn apply_event_scheduling_wait_persists_then_clears_on_scheduled() {
+        let waits = std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut last_sandboxes = std::collections::HashMap::new();
+        last_sandboxes.insert(
+            "sb-1".to_string(),
+            Sandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-sb-1".to_string(),
+                status: Some(SandboxStatus::default()),
+                ..Sandbox::default()
+            },
+        );
+
+        let failed = PlatformEvent {
+            reason: "FailedScheduling".to_string(),
+            message: "0/3 nodes are available: 3 Insufficient memory.".to_string(),
+            ..PlatformEvent::default()
+        };
+        let snapshot = apply_event_scheduling_wait(&waits, &mut last_sandboxes, "sb-1", &failed)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.status.as_ref().unwrap().conditions[0].message,
+            "0/3 nodes are available: 3 Insufficient memory."
+        );
+        assert_eq!(
+            lock_scheduling_waits(&waits)
+                .get("sb-1")
+                .map(String::as_str),
+            Some("0/3 nodes are available: 3 Insufficient memory.")
+        );
+
+        let scheduled = PlatformEvent {
+            reason: "Scheduled".to_string(),
+            message: "Successfully assigned openshell/sandbox-sb-1 to node-1".to_string(),
+            ..PlatformEvent::default()
+        };
+        let snapshot = apply_event_scheduling_wait(&waits, &mut last_sandboxes, "sb-1", &scheduled)
+            .expect("snapshot");
+        assert!(
+            snapshot
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .all(|condition| condition.r#type != "PodScheduled")
+        );
+        assert!(lock_scheduling_waits(&waits).get("sb-1").is_none());
     }
 
     #[test]

@@ -340,6 +340,8 @@ process/binary identity through `/proc/<entrypoint-pid>`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
+If a sandbox stays in `Provisioning` and create shows `Waiting to be scheduled...`, the pod has not been placed. The detail line and `openshell sandbox get` / `openshell sandbox list -o json` surface the kube-scheduler reason, such as insufficient CPU, memory, or GPU, a taint, or a quota. The wait is not a terminal failure: provisioning continues if a node becomes available. Create still uses its existing idle timeout while waiting, so inspect the sandbox with get or list after create exits.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>
