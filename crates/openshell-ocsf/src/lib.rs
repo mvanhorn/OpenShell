@@ -25,6 +25,7 @@
 pub const OCSF_VERSION: &str = "1.7.0";
 
 pub mod builders;
+pub mod cmd_line;
 pub mod ctx;
 pub mod enums;
 pub mod events;
@@ -65,4 +66,11 @@ pub use builders::{
 // --- Tracing layers ---
 pub use tracing_layers::{
     OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clone_current_event, emit_ocsf_event,
+};
+
+// --- Command-line capture ---
+pub use cmd_line::{
+    CMD_LINE_CAPTURE_ENABLED, CMD_LINE_TRUNCATION_MARKER, MAX_CMD_LINE_ARGS, MAX_CMD_LINE_CHARS,
+    REDACTED_ARG, SENSITIVE_CMD_LINE_FLAGS, cmd_line_capture_enabled, escape_shorthand_cmd_line,
+    sanitize_cmd_line,
 };

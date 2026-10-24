@@ -81,6 +81,41 @@ const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 #[cfg(test)]
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+fn cmdline_paths_unmapped_value(paths: &[PathBuf]) -> Option<serde_json::Value> {
+    if paths.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        ))
+    }
+}
+
+trait CmdlinePathsUnmapped {
+    fn cmdline_paths_unmapped(self, paths: &[PathBuf]) -> Self;
+}
+
+impl CmdlinePathsUnmapped for NetworkActivityBuilder<'_> {
+    fn cmdline_paths_unmapped(self, paths: &[PathBuf]) -> Self {
+        match cmdline_paths_unmapped_value(paths) {
+            Some(value) => self.unmapped("cmdline_paths", value),
+            None => self,
+        }
+    }
+}
+
+impl CmdlinePathsUnmapped for HttpActivityBuilder<'_> {
+    fn cmdline_paths_unmapped(self, paths: &[PathBuf]) -> Self {
+        match cmdline_paths_unmapped_value(paths) {
+            Some(value) => self.unmapped("cmdline_paths", value),
+            None => self,
+        }
+    }
+}
+
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
     action: NetworkAction,
@@ -687,16 +722,6 @@ async fn handle_tcp_connection(
             .collect::<Vec<_>>()
             .join(" -> ")
     };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
     // Log denied connections immediately — they never reach L7.
@@ -711,10 +736,8 @@ async fn handle_tcp_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+            .cmdline_paths_unmapped(&decision.cmdline_paths)
             .firewall_rule("-", "opa")
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
@@ -786,10 +809,8 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: trusted-gateway check failed for {host_lc}:{port}"
@@ -842,10 +863,12 @@ async fn handle_tcp_connection(
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                                 .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
+                                .actor_process(Process::from_bypass(
+                                    &binary_str,
+                                    &pid_str,
+                                    &ancestors_str,
+                                ))
+                                .cmdline_paths_unmapped(&decision.cmdline_paths)
                                 .firewall_rule("-", "ssrf")
                                 .message(format!(
                                     "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
@@ -890,10 +913,8 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: invalid allowed_ips in policy for {host_lc}:{port}"
@@ -944,10 +965,8 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: declared endpoint check failed for {host_lc}:{port}"
@@ -996,10 +1015,8 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: internal address {host_lc}:{port}"
@@ -1061,10 +1078,8 @@ async fn handle_tcp_connection(
             .status(StatusId::Success)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+            .cmdline_paths_unmapped(&decision.cmdline_paths)
             .firewall_rule(policy_str, "opa")
             .message(format!("{connect_msg} allowed {host_lc}:{port}"))
             .build();
@@ -1319,10 +1334,8 @@ async fn handle_tcp_connection(
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                .cmdline_paths_unmapped(&decision.cmdline_paths)
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
                     "CONNECT_L7 blocked unsupported tunnel protocol for {host_lc}:{port}"
@@ -3376,16 +3389,6 @@ async fn handle_forward_proxy(
             .collect::<Vec<_>>()
             .join(" -> ")
     };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
 
     // 4. Only proceed on explicit Allow — reject Deny
     let matched_policy = match &decision.action {
@@ -3404,10 +3407,8 @@ async fn handle_forward_proxy(
                     ))
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                     .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                    .actor_process(
-                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                            .with_cmd_line(&cmdline_str),
-                    )
+                    .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                    .cmdline_paths_unmapped(&decision.cmdline_paths)
                     .firewall_rule("-", "opa")
                     .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
                     .build();
@@ -3661,10 +3662,8 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                .cmdline_paths_unmapped(&decision.cmdline_paths)
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
                     "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{path}"
@@ -3903,10 +3902,8 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                .cmdline_paths_unmapped(&decision.cmdline_paths)
                 .firewall_rule(policy_str, engine_type)
                 .message(log_message)
                 .build();
@@ -3983,10 +3980,8 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: trusted-gateway check failed for {host_lc}:{port}"
@@ -4040,10 +4035,12 @@ async fn handle_forward_proxy(
                                 ))
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
+                                .actor_process(Process::from_bypass(
+                                    &binary_str,
+                                    &pid_str,
+                                    &ancestors_str,
+                                ))
+                                .cmdline_paths_unmapped(&decision.cmdline_paths)
                                 .firewall_rule(policy_str, "ssrf")
                                 .message(format!(
                                     "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
@@ -4092,10 +4089,8 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}"
@@ -4149,10 +4144,8 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: declared endpoint check failed for {host_lc}:{port}"
@@ -4203,10 +4196,8 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                        .cmdline_paths_unmapped(&decision.cmdline_paths)
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}"
@@ -4278,10 +4269,8 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+                .cmdline_paths_unmapped(&decision.cmdline_paths)
                 .message(format!(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
@@ -4315,10 +4304,8 @@ async fn handle_forward_proxy(
             ))
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
+            .cmdline_paths_unmapped(&decision.cmdline_paths)
             .firewall_rule(policy_str, "opa")
             .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
             .build();
@@ -4530,6 +4517,63 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn network_record_puts_path_list_in_unmapped_not_cmd_line() {
+        let paths = vec![
+            PathBuf::from("/usr/bin/curl"),
+            PathBuf::from("/usr/bin/python3"),
+        ];
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .actor_process(Process::from_bypass("/usr/bin/curl", "58", "bash -> curl"))
+            .cmdline_paths_unmapped(&paths)
+            .message("CONNECT allowed api.github.com:443")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert!(
+            json["actor"]["process"].get("cmd_line").is_none(),
+            "path list must not be presented as cmd_line, got {:?}",
+            json["actor"]["process"].get("cmd_line")
+        );
+        assert_eq!(
+            json["unmapped"]["cmdline_paths"],
+            serde_json::json!(["/usr/bin/curl", "/usr/bin/python3"])
+        );
+        let cmd_line_str = json["actor"]["process"]
+            .get("cmd_line")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !cmd_line_str.contains("/usr/bin/python3"),
+            "absolute-path ancestry must not appear in cmd_line"
+        );
+    }
+
+    #[test]
+    fn network_record_omits_empty_cmdline_paths_and_cmd_line() {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .actor_process(Process::from_bypass("/usr/bin/curl", "58", ""))
+            .cmdline_paths_unmapped(&[])
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert!(json["actor"]["process"].get("cmd_line").is_none());
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("cmdline_paths"))
+                .is_none()
+        );
+        assert_ne!(
+            json["actor"]["process"]
+                .get("cmd_line")
+                .and_then(|v| v.as_str()),
+            Some("-")
+        );
+    }
 
     #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {

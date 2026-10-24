@@ -182,3 +182,10 @@ intermediate steps where the final observable event is logged separately.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
+
+Process launch records omit `process.cmd_line` unless the
+`ocsf_cmd_line_enabled` setting is on. When capture is enabled, the value is
+length-bounded and a denylist redacts known secret-looking flags and URL
+userinfo. The denylist cannot catch positional secrets. Network activity
+records do not present the process-ancestry path list as `cmd_line`; that
+list is stored under `unmapped.cmdline_paths` when present.

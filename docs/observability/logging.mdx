@@ -143,11 +143,19 @@ An SSH connection accepted (one event per invocation, arriving over the supervis
 OCSF SSH:OPEN [INFO] ALLOWED
 ```
 
-A process launched inside the sandbox:
+A process launched inside the sandbox. Command arguments are omitted unless `ocsf_cmd_line_enabled` is on:
 
 ```text
 OCSF PROC:LAUNCH [INFO] sleep(49)
 ```
+
+With capture enabled, the shorthand includes a bounded, redacted `[cmd:...]` field:
+
+```text
+OCSF PROC:LAUNCH [INFO] sleep(49) [cmd:sleep 5]
+```
+
+See [OCSF JSON Export](/observability/ocsf-json-export) for the setting, length bound, and redaction rules.
 
 A policy reload after a settings change:
 

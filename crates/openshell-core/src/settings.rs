@@ -107,6 +107,14 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
+/// Sandbox-level opt-in for OCSF `process.cmd_line` capture on launch records.
+///
+/// When true, the supervisor writes a bounded, redacted command line onto
+/// process launch events. Defaults to false. Redaction is a denylist of
+/// secret-looking flags and URL userinfo; it cannot catch positional secrets.
+/// See `docs/observability/ocsf-json-export.mdx`.
+pub const OCSF_CMD_LINE_ENABLED_KEY: &str = "ocsf_cmd_line_enabled";
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -120,6 +128,13 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
         key: "ocsf_json_enabled",
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
+    // When true, process launch records include a bounded, redacted
+    // `process.cmd_line`. Defaults to false (field omitted).
+    RegisteredSetting {
+        key: OCSF_CMD_LINE_ENABLED_KEY,
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
@@ -168,9 +183,9 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        OCSF_CMD_LINE_ENABLED_KEY, PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES,
+        PROVIDERS_V2_ENABLED_KEY, REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind,
+        parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[test]
@@ -189,6 +204,14 @@ mod tests {
         let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
             .expect("providers_v2_enabled should be registered");
         assert_eq!(setting.kind, SettingValueKind::Bool);
+    }
+
+    #[test]
+    fn setting_for_key_returns_ocsf_cmd_line_enabled() {
+        let setting = setting_for_key(OCSF_CMD_LINE_ENABLED_KEY)
+            .expect("ocsf_cmd_line_enabled should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Bool);
+        assert!(setting.allowed_string_values.is_none());
     }
 
     // ---- RegisteredSetting::validate_string_value ----

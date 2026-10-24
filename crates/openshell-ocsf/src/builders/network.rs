@@ -181,4 +181,24 @@ mod tests {
         assert_eq!(json["device"]["hostname"], "sandbox-abc123");
         assert_eq!(json["is_src_dst_assignment_known"], true);
     }
+
+    #[test]
+    fn test_network_activity_builder_cmdline_paths_are_unmapped() {
+        let ctx = test_sandbox_context();
+        let event = NetworkActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .actor_process(Process::new("/usr/bin/curl", 58))
+            .unmapped(
+                "cmdline_paths",
+                serde_json::json!(["/usr/bin/curl", "/usr/bin/python3"]),
+            )
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert!(json["actor"]["process"].get("cmd_line").is_none());
+        assert_eq!(
+            json["unmapped"]["cmdline_paths"],
+            serde_json::json!(["/usr/bin/curl", "/usr/bin/python3"])
+        );
+    }
 }

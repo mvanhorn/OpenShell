@@ -338,18 +338,12 @@ pub async fn run_process(
     if let Some(tx) = entrypoint_started_tx {
         let _ = tx.send(handle.pid());
     }
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .launch_type(LaunchTypeId::Spawn)
-            .process(OcsfProcess::new(program, i64::from(handle.pid())))
-            .message(format!("Process started: pid={}", handle.pid()))
-            .build()
-    );
+    ocsf_emit!(process_launch_event(
+        program,
+        args,
+        i64::from(handle.pid()),
+        openshell_ocsf::cmd_line_capture_enabled(),
+    ));
 
     // Wait for process with optional timeout
     let result = if timeout_secs > 0 {
@@ -407,6 +401,47 @@ fn ssh_proxy_url_for_policy(
     proxy.http_addr.map(|addr| format!("http://{addr}"))
 }
 
+/// Build the process launch OCSF event.
+///
+/// `cmd_line` is included only when `capture_cmd_line` is true. The launch
+/// `message` carries the pid and never the argument vector.
+pub(crate) fn process_launch_event(
+    program: &str,
+    args: &[String],
+    pid: i64,
+    capture_cmd_line: bool,
+) -> openshell_ocsf::OcsfEvent {
+    let mut process = OcsfProcess::new(program, pid);
+    if capture_cmd_line {
+        process = process.with_cmd_line(&openshell_ocsf::sanitize_cmd_line(program, args));
+    }
+    ProcessActivityBuilder::new(ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .launch_type(LaunchTypeId::Spawn)
+        .process(process)
+        .message(format!("Process started: pid={pid}"))
+        .build()
+}
+
+fn effective_bool_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<bool> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
 /// Eagerly fetch initial settings and install the agent-driven policy
 /// proposal skill if the flag is on at startup.
 ///
@@ -417,33 +452,45 @@ fn ssh_proxy_url_for_policy(
 /// Best-effort: any failure (no gateway, RPC error, install failure) is
 /// logged but does not fail sandbox startup.
 async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoint: Option<&str>) {
-    use openshell_core::proto::setting_value;
     use std::sync::atomic::Ordering;
 
-    let Some(flag) = openshell_core::proposals::AGENT_PROPOSALS_ENABLED.get() else {
+    let fetched = if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint) {
+        match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
+            Ok(client) => client.poll_settings(id).await.ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(result) = fetched.as_ref() {
+        if let Some(flag) = openshell_core::proposals::AGENT_PROPOSALS_ENABLED.get() {
+            let initial = effective_bool_setting(
+                &result.settings,
+                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+            )
+            .unwrap_or(false);
+            flag.store(initial, Ordering::Relaxed);
+        }
+        if let Some(flag) = openshell_ocsf::CMD_LINE_CAPTURE_ENABLED.get() {
+            let initial = effective_bool_setting(
+                &result.settings,
+                openshell_core::settings::OCSF_CMD_LINE_ENABLED_KEY,
+            )
+            .unwrap_or(false);
+            flag.store(initial, Ordering::Relaxed);
+        }
+    }
+
+    if openshell_core::proposals::AGENT_PROPOSALS_ENABLED
+        .get()
+        .is_none()
+    {
         // The orchestrator is responsible for setting the OnceLock before
         // calling run_process. If it isn't set, behave as if the flag is
         // off and skip the install.
         tracing::debug!("AGENT_PROPOSALS_ENABLED not initialized; skipping skill install");
         return;
-    };
-
-    if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
-        && let Ok(client) =
-            openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await
-        && let Ok(result) = client.poll_settings(id).await
-    {
-        let initial = result
-            .settings
-            .get(openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
-            .and_then(|es| es.value.as_ref())
-            .and_then(|sv| sv.value.as_ref())
-            .and_then(|v| match v {
-                setting_value::Value::BoolValue(b) => Some(*b),
-                _ => None,
-            })
-            .unwrap_or(false);
-        flag.store(initial, Ordering::Relaxed);
     }
 
     if openshell_core::proposals::agent_proposals_enabled() {
@@ -511,5 +558,59 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[test]
+    fn process_launch_omits_cmd_line_when_capture_is_disabled() {
+        let event =
+            process_launch_event("curl", &["https://github.com/zen".to_string()], 42, false);
+        let json = event.to_json().unwrap();
+        assert_eq!(json["process"]["name"], "curl");
+        assert_eq!(json["process"]["pid"], 42);
+        assert!(json["process"].get("cmd_line").is_none());
+        assert_eq!(json["message"], "Process started: pid=42");
+        assert!(
+            !json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("github.com")
+        );
+    }
+
+    #[test]
+    fn process_launch_includes_non_path_argument_when_capture_is_enabled() {
+        let event = process_launch_event("curl", &["https://github.com/zen".to_string()], 42, true);
+        let json = event.to_json().unwrap();
+        assert_eq!(json["process"]["cmd_line"], "curl https://github.com/zen");
+        assert_eq!(json["message"], "Process started: pid=42");
+    }
+
+    #[test]
+    fn process_launch_redacts_sensitive_argument_when_capture_is_enabled() {
+        let event = process_launch_event(
+            "tool",
+            &[
+                "--token".to_string(),
+                "s3cret".to_string(),
+                "https://github.com".to_string(),
+            ],
+            7,
+            true,
+        );
+        let json = event.to_json().unwrap();
+        let cmd = json["process"]["cmd_line"].as_str().unwrap();
+        assert!(cmd.contains("<redacted>"));
+        assert!(!cmd.contains("s3cret"));
+        assert!(cmd.contains("https://github.com"));
+    }
+
+    #[test]
+    fn process_launch_truncates_cmd_line_at_documented_bound() {
+        let long = "a".repeat(openshell_ocsf::MAX_CMD_LINE_CHARS + 80);
+        let event = process_launch_event("p", &[long], 1, true);
+        let json = event.to_json().unwrap();
+        let cmd = json["process"]["cmd_line"].as_str().unwrap();
+        assert_eq!(cmd.chars().count(), openshell_ocsf::MAX_CMD_LINE_CHARS);
+        assert!(cmd.ends_with(openshell_ocsf::CMD_LINE_TRUNCATION_MARKER));
     }
 }

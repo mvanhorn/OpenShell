@@ -349,6 +349,7 @@ const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings set --global --key providers_v2_enabled --value true
   $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
   $ openshell settings set --global --key ocsf_json_enabled --value true
+  $ openshell settings set --global --key ocsf_cmd_line_enabled --value true
   $ openshell settings delete --global --key providers_v2_enabled
 ";
 

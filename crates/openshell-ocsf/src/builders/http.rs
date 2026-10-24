@@ -25,6 +25,7 @@ pub struct HttpActivityBuilder<'a> {
     firewall_rule: Option<FirewallRule>,
     message: Option<String>,
     status_detail: Option<String>,
+    unmapped: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl<'a> HttpActivityBuilder<'a> {
@@ -45,7 +46,17 @@ impl<'a> HttpActivityBuilder<'a> {
             firewall_rule: None,
             message: None,
             status_detail: None,
+            unmapped: None,
         }
+    }
+
+    /// Add an unmapped field.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(key.to_string(), value.into());
+        self
     }
 
     #[must_use]
@@ -85,6 +96,9 @@ impl<'a> HttpActivityBuilder<'a> {
         );
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
+        }
+        if let Some(unmapped) = self.unmapped {
+            base.unmapped = Some(serde_json::Value::Object(unmapped));
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
@@ -163,5 +177,25 @@ mod tests {
         assert_eq!(json["class_uid"], 4002);
         assert_eq!(json["status_detail"], "resolves to always-blocked address");
         assert_eq!(json["action_id"], 2); // Denied
+    }
+
+    #[test]
+    fn test_http_activity_builder_unmapped_cmdline_paths() {
+        let ctx = test_sandbox_context();
+        let event = HttpActivityBuilder::new(&ctx)
+            .activity(ActivityId::Reset)
+            .actor_process(Process::new("curl", 88))
+            .unmapped(
+                "cmdline_paths",
+                serde_json::json!(["/usr/bin/curl", "/opt/app"]),
+            )
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert!(json["actor"]["process"].get("cmd_line").is_none());
+        assert_eq!(
+            json["unmapped"]["cmdline_paths"],
+            serde_json::json!(["/usr/bin/curl", "/opt/app"])
+        );
     }
 }

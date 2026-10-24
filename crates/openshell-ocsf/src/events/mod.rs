@@ -218,6 +218,21 @@ mod tests {
     }
 
     #[test]
+    fn process_activity_with_cmd_line_satisfies_schema_required_fields() {
+        let ctx = test_sandbox_context();
+        let event = ProcessActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .process(Process::new("curl", 42).with_cmd_line("curl https://github.com/zen"))
+            .build();
+
+        let json = event.to_json().unwrap();
+        let schema = crate::validation::load_class_schema("process_activity");
+        crate::validation::validate_required_fields(&json, &schema);
+        assert_eq!(json["process"]["cmd_line"], "curl https://github.com/zen");
+    }
+
+    #[test]
     fn test_roundtrip_detection_finding() {
         let ctx = test_sandbox_context();
         let event = DetectionFindingBuilder::new(&ctx)

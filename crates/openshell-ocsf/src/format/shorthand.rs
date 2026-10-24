@@ -285,7 +285,7 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| format!(" [cmd:{}]", crate::cmd_line::escape_shorthand_cmd_line(c)))
                     .unwrap_or_default();
 
                 format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
@@ -884,6 +884,26 @@ mod tests {
             shorthand,
             "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
         );
+    }
+
+    #[test]
+    fn test_process_activity_shorthand_escapes_cmd_line_metacharacters() {
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("echo", 7).with_cmd_line("echo foo]bar\nbaz"),
+            actor: None,
+            launch_type: Some(LaunchTypeId::Spawn),
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            r"PROC:LAUNCH [INFO] echo(7) [cmd:echo foo\]bar\nbaz]"
+        );
+        assert!(!shorthand.contains('\n'));
     }
 
     #[test]

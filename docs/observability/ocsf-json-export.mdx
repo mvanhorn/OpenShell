@@ -165,6 +165,52 @@ The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `opens
 
 The shorthand log is always active. The JSON export is opt-in through `ocsf_json_enabled`.
 
+## Command Line Capture
+
+Process launch records omit `process.cmd_line` by default. Enable capture with `ocsf_cmd_line_enabled` when you need the executed command in audit output.
+
+Global:
+
+```shell
+openshell settings set --global --key ocsf_cmd_line_enabled --value true
+```
+
+Per-sandbox:
+
+```shell
+openshell settings set my-sandbox --key ocsf_cmd_line_enabled --value true
+```
+
+The supervisor reads the setting at startup before it emits the launch record, and again on each poll cycle (by default every 10 seconds).
+
+When capture is on, OpenShell writes a single command-line string:
+
+- The program and arguments are joined with spaces. Arguments that contain whitespace are double-quoted.
+- Control characters are escaped.
+- The string is capped at 64 argument slots and 4096 characters. Overflow appends ` ...`.
+- Flag values for `--password`, `--token`, `--api-key`, `--api_key`, and `--secret` are replaced with `<redacted>`, including `--flag=value` forms. Matching is case-insensitive.
+- URL userinfo (`https://user:pass@host`) is replaced with `https://REDACTED@host`.
+
+Redaction is a denylist. It does not catch positional secrets, values passed through a file flag, or secrets encoded into paths. Treat captured `cmd_line` as possibly sensitive and as data chosen by whoever defined the launch spec.
+
+Network and HTTP activity records never put the process-ancestry absolute-path list in `cmd_line`. That list, when present, is stored under `unmapped.cmdline_paths`.
+
+Example launch record with capture enabled:
+
+```json
+{
+  "class_uid": 1007,
+  "class_name": "Process Activity",
+  "activity_name": "Launch",
+  "process": {
+    "name": "curl",
+    "pid": 57,
+    "cmd_line": "curl https://github.com/zen"
+  },
+  "message": "Process started: pid=57"
+}
+```
+
 ## Next Steps
 
 - Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.

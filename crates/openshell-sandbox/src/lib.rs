@@ -303,6 +303,14 @@ pub async fn run_sandbox(
         debug!("agent proposals flag already initialized, keeping existing");
     }
 
+    let cmd_line_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if openshell_ocsf::CMD_LINE_CAPTURE_ENABLED
+        .set(cmd_line_enabled)
+        .is_err()
+    {
+        debug!("OCSF command-line capture flag already initialized, keeping existing");
+    }
+
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
@@ -2398,7 +2406,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
             InitialPollDisposition::Acknowledge(candidate) => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                apply_ocsf_settings(&ctx.ocsf_enabled, &result.settings);
                 current_config_revision = candidate.config_revision;
                 current_policy_hash.clone_from(&candidate.policy_hash);
                 current_settings = result.settings;
@@ -2413,7 +2421,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
             InitialPollDisposition::Reconcile => pending_result = Some(result),
             InitialPollDisposition::TrackOnly => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                apply_ocsf_settings(&ctx.ocsf_enabled, &result.settings);
                 current_config_revision = result.config_revision;
                 current_policy_hash = result.policy_hash.clone();
                 current_settings = result.settings;
@@ -2600,8 +2608,8 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
         }
 
-        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
-        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        // Apply OCSF JSON and command-line capture toggles.
+        apply_ocsf_settings(&ctx.ocsf_enabled, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -2643,6 +2651,16 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     }
 }
 
+fn apply_ocsf_settings(
+    json_enabled: &std::sync::atomic::AtomicBool,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    apply_ocsf_json_setting(json_enabled, settings);
+    if let Some(flag) = openshell_ocsf::CMD_LINE_CAPTURE_ENABLED.get() {
+        apply_ocsf_cmd_line_setting(flag, settings);
+    }
+}
+
 fn apply_ocsf_json_setting(
     enabled: &std::sync::atomic::AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -2653,6 +2671,26 @@ fn apply_ocsf_json_setting(
     let prev_ocsf = enabled.swap(new_ocsf, Ordering::Relaxed);
     if new_ocsf != prev_ocsf {
         info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+    }
+}
+
+fn apply_ocsf_cmd_line_setting(
+    enabled: &std::sync::atomic::AtomicBool,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let new_cmd = extract_bool_setting(
+        settings,
+        openshell_core::settings::OCSF_CMD_LINE_ENABLED_KEY,
+    )
+    .unwrap_or(false);
+    let prev_cmd = enabled.swap(new_cmd, Ordering::Relaxed);
+    if new_cmd != prev_cmd {
+        info!(
+            ocsf_cmd_line_enabled = new_cmd,
+            "OCSF command-line capture toggled"
+        );
     }
 }
 
@@ -2890,6 +2928,30 @@ mod tests {
         let settings = std::collections::HashMap::new();
 
         apply_ocsf_json_setting(&enabled, &settings);
+
+        assert!(!enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_cmd_line_setting_enables_from_initial_settings_snapshot() {
+        let enabled = AtomicBool::new(false);
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            openshell_core::settings::OCSF_CMD_LINE_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+
+        apply_ocsf_cmd_line_setting(&enabled, &settings);
+
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_cmd_line_setting_disables_when_setting_is_unset() {
+        let enabled = AtomicBool::new(true);
+        let settings = std::collections::HashMap::new();
+
+        apply_ocsf_cmd_line_setting(&enabled, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
     }
